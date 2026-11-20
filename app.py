@@ -2,6 +2,7 @@ import ast
 import operator
 import os
 import secrets
+import time
 import uuid
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify, render_template_string, session, Response
@@ -108,6 +109,16 @@ def build_genai_contents(history: list[dict[str, str]]) -> list[types.Content]:
     return contents
 
 
+def _is_busy(exc) -> bool:
+    t = str(exc)
+    return any(c in t for c in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "INTERNAL"))
+
+
+def _is_auth(exc) -> bool:
+    t = str(exc)
+    return any(c in t for c in ("401", "403", "UNAUTHENTICATED", "PERMISSION_DENIED"))
+
+
 def generate_jarvis_reply(history: list[dict[str, str]], model_name: str = "") -> str:
     model_name = model_name or DEFAULT_MODEL
     api_key = os.environ.get("GEMINI_API_KEY", GEMINI_API_KEY)
@@ -124,9 +135,9 @@ def generate_jarvis_reply(history: list[dict[str, str]], model_name: str = "") -
     client = genai.Client(api_key=api_key)
     contents = build_genai_contents(history)
 
-    def _call(tools):
+    def _call(model, tools):
         return client.models.generate_content(
-            model=model_name,
+            model=model,
             contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction=JARVIS_SYSTEM_INSTRUCTION,
@@ -135,15 +146,31 @@ def generate_jarvis_reply(history: list[dict[str, str]], model_name: str = "") -
             ),
         )
 
-    try:
-        response = _call(AGENT_TOOLS)  # SDK runs tool calls automatically
-    except Exception as exc:
-        # Retry once without tools; if it's an auth/quota error this raises again
-        # and the route handler shows the message.
-        if "API key" in str(exc) or "quota" in str(exc).lower():
-            raise
-        response = _call(None)
-    return response.text or "I appear to have received an empty telemetry packet, Boss."
+    models = [model_name]
+    fb = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-3.8-flash")
+    if fb and fb != model_name:
+        models.append(fb)
+
+    last_exc = None
+    for m in models:
+        for attempt in range(2):
+            try:
+                try:
+                    response = _call(m, AGENT_TOOLS)  # SDK runs tool calls automatically
+                except Exception as exc:
+                    if _is_busy(exc) or _is_auth(exc):
+                        raise
+                    response = _call(m, None)  # retry without tools
+                return response.text or "I appear to have received an empty telemetry packet, Boss."
+            except Exception as exc:
+                last_exc = exc
+                if _is_auth(exc):
+                    raise
+                if _is_busy(exc) and attempt == 0:
+                    time.sleep(2)
+                    continue
+                break  # try next model
+    raise last_exc
 
 
 HTML_TEMPLATE = """<!DOCTYPE html>
